@@ -150,17 +150,20 @@ router.post('/bulk', requireAuth, requireManager, requireDb, async (req: AuthedR
   const ops = playerIds.map((playerId) => {
     const pl = byId.get(String(playerId));
     const defaultAmount = pl?.monthlyDues ?? settings.defaultMonthlyDues;
+    const $set: Record<string, unknown> = {
+      paid,
+      recordedBy: req.user?.userId,
+    };
+    if (paid) $set.paidAt = new Date();
+    const update: Record<string, unknown> = {
+      $set,
+      $setOnInsert: { amount: defaultAmount },
+    };
+    if (!paid) update.$unset = { paidAt: '' };
     return {
       updateOne: {
         filter: { playerId, month },
-        update: {
-          $set: {
-            paid,
-            paidAt: paid ? new Date() : null,
-            recordedBy: req.user?.userId,
-          },
-          $setOnInsert: { amount: defaultAmount },
-        },
+        update,
         upsert: true,
       },
     };
