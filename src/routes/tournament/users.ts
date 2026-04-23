@@ -50,7 +50,7 @@ router.post(
       email: String(email).toLowerCase().trim(),
       name,
       passwordHash,
-      role: role === 'super_admin' ? 'super_admin' : 'admin',
+      role: ['super_admin', 'admin', 'referee'].includes(role) ? role : 'admin',
       isActive: true,
     });
     res.status(201).json({
@@ -75,7 +75,7 @@ router.patch(
     const updates: Record<string, unknown> = {};
     if (name !== undefined) updates.name = name;
     if (isActive !== undefined) updates.isActive = Boolean(isActive);
-    if (role !== undefined && ['admin', 'super_admin'].includes(role)) updates.role = role;
+    if (role !== undefined && ['admin', 'super_admin', 'referee'].includes(role)) updates.role = role;
     if (password) {
       if (password.length < 6) return res.status(400).json({ error: 'Password too short' });
       updates.passwordHash = await bcrypt.hash(password, 10);

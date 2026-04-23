@@ -10,6 +10,12 @@ export interface Organizer {
   email?: string;
 }
 
+export interface RoundFormat {
+  round: number;
+  pointsPerSet: number;
+  bestOf: number;
+}
+
 export interface TournamentDoc {
   _id: Types.ObjectId;
   name: string;
@@ -28,6 +34,8 @@ export interface TournamentDoc {
   entryFee?: number;
   prize?: string;
   rules?: string;
+  publicRegistrationOpen?: boolean;
+  roundFormats?: RoundFormat[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -38,6 +46,15 @@ const organizerSchema = new Schema<Organizer>(
     role: String,
     phone: String,
     email: String,
+  },
+  { _id: false }
+);
+
+const roundFormatSchema = new Schema<RoundFormat>(
+  {
+    round: { type: Number, required: true },
+    pointsPerSet: { type: Number, required: true },
+    bestOf: { type: Number, required: true },
   },
   { _id: false }
 );
@@ -68,6 +85,8 @@ const tournamentSchema = new Schema<TournamentDoc>(
     entryFee: Number,
     prize: String,
     rules: String,
+    publicRegistrationOpen: { type: Boolean, default: false },
+    roundFormats: { type: [roundFormatSchema], default: undefined },
   },
   { timestamps: true }
 );

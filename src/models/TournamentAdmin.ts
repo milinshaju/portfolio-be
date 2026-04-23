@@ -1,6 +1,6 @@
 import { Schema, model, Types } from 'mongoose';
 
-export type TournamentAdminRole = 'super_admin' | 'admin';
+export type TournamentAdminRole = 'super_admin' | 'admin' | 'referee';
 
 export interface TournamentAdminDoc {
   _id: Types.ObjectId;
@@ -27,7 +27,7 @@ const schema = new Schema<TournamentAdminDoc>(
     name: { type: String, required: true, trim: true },
     role: {
       type: String,
-      enum: ['super_admin', 'admin'],
+      enum: ['super_admin', 'admin', 'referee'],
       required: true,
       default: 'admin',
     },

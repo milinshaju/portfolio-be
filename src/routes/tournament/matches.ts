@@ -2,14 +2,24 @@ import { Router } from 'express';
 import type { Response, NextFunction } from 'express';
 import { Types } from 'mongoose';
 import { Match } from '../../models/Match';
+import type { SetScore } from '../../models/Match';
 import { Team } from '../../models/Team';
 import { Tournament } from '../../models/Tournament';
+import type { RoundFormat } from '../../models/Tournament';
 import {
   requireTournamentAuth,
   requireTournamentRole,
 } from '../../middleware/tournamentAuth';
 import { isDbConnected } from '../../db';
 import { standardSeedOrder, roundsForSize } from '../../lib/bracketSeeding';
+import {
+  applyPoint,
+  currentServerPlayerIndex,
+  initialState,
+  isSetWon,
+  matchWinner,
+  stateFromMatch,
+} from '../../lib/doublesScoring';
 
 const router = Router();
 
@@ -19,6 +29,21 @@ function requireDb(_req: unknown, res: Response, next: NextFunction) {
 }
 
 const requireManager = requireTournamentRole('admin', 'super_admin');
+const requireScorer = requireTournamentRole('admin', 'super_admin', 'referee');
+
+function defaultRoundFormat(round: number, totalRounds: number): { pointsPerSet: number; bestOf: number } {
+  const fromEnd = totalRounds - round;
+  // Final (fromEnd 0) and Semifinal (fromEnd 1) → 21 × best of 3.
+  // Everything else → 30 × 1.
+  if (fromEnd <= 1) return { pointsPerSet: 21, bestOf: 3 };
+  return { pointsPerSet: 30, bestOf: 1 };
+}
+
+function formatForRound(tournamentRoundFormats: RoundFormat[] | undefined, round: number, totalRounds: number) {
+  const override = tournamentRoundFormats?.find((f) => f.round === round);
+  if (override) return { pointsPerSet: override.pointsPerSet, bestOf: override.bestOf };
+  return defaultRoundFormat(round, totalRounds);
+}
 
 router.get('/', requireDb, async (req, res) => {
   const tournamentId = String(req.query.tournamentId || '');
@@ -44,8 +69,18 @@ router.get('/schedule', requireDb, async (req, res) => {
   res.json({ matches });
 });
 
+router.get('/:id', requireDb, async (req, res) => {
+  const m = await Match.findById(req.params.id)
+    .populate('teamAId', 'name player1 player2 seed')
+    .populate('teamBId', 'name player1 player2 seed')
+    .populate('winnerId', 'name')
+    .lean();
+  if (!m) return res.status(404).json({ error: 'Not found' });
+  res.json({ match: m });
+});
+
 router.patch('/:id', requireTournamentAuth, requireManager, requireDb, async (req, res) => {
-  const { scheduledAt, court, scoreA, scoreB, status } = req.body ?? {};
+  const { scheduledAt, court, scoreA, scoreB, status, pointsPerSet, bestOf } = req.body ?? {};
   const updates: Record<string, unknown> = {};
   if (scheduledAt !== undefined) updates.scheduledAt = scheduledAt ? new Date(scheduledAt) : null;
   if (court !== undefined) updates.court = court || null;
@@ -54,12 +89,295 @@ router.patch('/:id', requireTournamentAuth, requireManager, requireDb, async (re
   if (status && ['pending', 'scheduled', 'in_progress', 'completed', 'bye'].includes(status)) {
     updates.status = status;
   }
+  if (typeof pointsPerSet === 'number' && pointsPerSet > 0) updates.pointsPerSet = pointsPerSet;
+  if (typeof bestOf === 'number' && [1, 3, 5].includes(bestOf)) updates.bestOf = bestOf;
+
+  const existing = await Match.findById(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Not found' });
+  if ((('pointsPerSet' in updates) || ('bestOf' in updates)) && existing.status === 'in_progress') {
+    return res.status(409).json({ error: 'Cannot change match format after the match has started' });
+  }
+
   const m = await Match.findByIdAndUpdate(req.params.id, updates, { new: true })
     .populate('teamAId', 'name')
     .populate('teamBId', 'name')
     .populate('winnerId', 'name');
   if (!m) return res.status(404).json({ error: 'Not found' });
   res.json({ match: m });
+});
+
+/**
+ * Start a match: referee picks first server team, first server player, first receiver player.
+ * Requires both teams assigned and status pending/scheduled.
+ */
+router.post('/:id/start', requireTournamentAuth, requireScorer, requireDb, async (req, res) => {
+  const { firstServerTeam, firstServerPlayerIndex, firstReceiverPlayerIndex } = req.body ?? {};
+  if (firstServerTeam !== 'A' && firstServerTeam !== 'B') {
+    return res.status(400).json({ error: 'firstServerTeam must be A or B' });
+  }
+  if (![0, 1].includes(Number(firstServerPlayerIndex))) {
+    return res.status(400).json({ error: 'firstServerPlayerIndex must be 0 or 1' });
+  }
+  if (![0, 1].includes(Number(firstReceiverPlayerIndex))) {
+    return res.status(400).json({ error: 'firstReceiverPlayerIndex must be 0 or 1' });
+  }
+
+  const match = await Match.findById(req.params.id);
+  if (!match) return res.status(404).json({ error: 'Match not found' });
+  if (!match.teamAId || !match.teamBId) {
+    return res.status(400).json({ error: 'Both teams must be assigned' });
+  }
+  if (match.status !== 'pending' && match.status !== 'scheduled') {
+    return res.status(409).json({ error: `Cannot start a match in status "${match.status}"` });
+  }
+
+  const state = initialState({
+    firstServerTeam,
+    firstServerPlayerIndex: Number(firstServerPlayerIndex) as 0 | 1,
+    firstReceiverPlayerIndex: Number(firstReceiverPlayerIndex) as 0 | 1,
+  });
+
+  match.sets = [{ a: 0, b: 0 }];
+  match.currentSet = 0;
+  match.servingTeam = state.servingTeam;
+  match.rightCourtPlayerA = state.rightCourtPlayerA;
+  match.rightCourtPlayerB = state.rightCourtPlayerB;
+  match.initialServingTeam = state.servingTeam;
+  match.initialRightCourtPlayerA = state.rightCourtPlayerA;
+  match.initialRightCourtPlayerB = state.rightCourtPlayerB;
+  match.points = [];
+  match.scoreA = 0;
+  match.scoreB = 0;
+  match.status = 'in_progress';
+  match.startedAt = new Date();
+  match.winnerId = undefined;
+  await match.save();
+
+  const populated = await Match.findById(match._id)
+    .populate('teamAId', 'name player1 player2 seed')
+    .populate('teamBId', 'name player1 player2 seed')
+    .lean();
+  res.json({ match: populated });
+});
+
+/** Score one point. Body: { winner: 'A' | 'B' } */
+router.post('/:id/point', requireTournamentAuth, requireScorer, requireDb, async (req, res) => {
+  const { winner } = req.body ?? {};
+  if (winner !== 'A' && winner !== 'B') {
+    return res.status(400).json({ error: 'winner must be A or B' });
+  }
+  const match = await Match.findById(req.params.id);
+  if (!match) return res.status(404).json({ error: 'Match not found' });
+  if (match.status !== 'in_progress') {
+    return res.status(409).json({ error: 'Match is not in progress' });
+  }
+
+  const state = stateFromMatch(match);
+  if (!state) return res.status(409).json({ error: 'Match state is not initialised' });
+
+  const serverTeam = state.servingTeam;
+  const serverPlayerIndex = currentServerPlayerIndex(state);
+  const nextState = applyPoint(state, winner);
+
+  // Update current set scores
+  const currentSet = match.sets[match.currentSet];
+  currentSet.a = nextState.scoreA;
+  currentSet.b = nextState.scoreB;
+
+  // Check if current set is won
+  const setWinner = isSetWon(currentSet, match.pointsPerSet);
+  if (setWinner) {
+    currentSet.winner = setWinner;
+  }
+
+  match.servingTeam = nextState.servingTeam;
+  match.rightCourtPlayerA = nextState.rightCourtPlayerA;
+  match.rightCourtPlayerB = nextState.rightCourtPlayerB;
+
+  match.points.push({
+    set: match.currentSet,
+    serverTeam,
+    serverPlayerIndex,
+    winner,
+    scoreA: nextState.scoreA,
+    scoreB: nextState.scoreB,
+    at: new Date(),
+  });
+
+  // Aggregate scoreA/scoreB: use current-set score for in-progress feel
+  match.scoreA = nextState.scoreA;
+  match.scoreB = nextState.scoreB;
+
+  if (setWinner) {
+    const overall = matchWinner(match.sets as unknown as SetScore[], match.bestOf);
+    if (overall) {
+      match.status = 'completed';
+      match.completedAt = new Date();
+      match.winnerId = overall === 'A' ? match.teamAId : match.teamBId;
+    } else {
+      // Start next set. Winner of previous set serves first in the next set from their right court,
+      // by whichever player the referee designated originally (we keep rightCourtPlayer as-is and
+      // reset parity-based positions via fresh initial state for the new serving team).
+      // Convention: in next set, the winning team's current right-court player serves first.
+      const nextServingTeam = setWinner;
+      const nextRightA = match.rightCourtPlayerA!;
+      const nextRightB = match.rightCourtPlayerB!;
+      match.sets.push({ a: 0, b: 0 });
+      match.currentSet = match.sets.length - 1;
+      match.servingTeam = nextServingTeam;
+      match.rightCourtPlayerA = nextRightA;
+      match.rightCourtPlayerB = nextRightB;
+      match.scoreA = 0;
+      match.scoreB = 0;
+    }
+  }
+
+  await match.save();
+
+  if (match.status === 'completed' && match.nextMatchId) {
+    const update =
+      match.slot === 'A' ? { teamAId: match.winnerId } : { teamBId: match.winnerId };
+    await Match.findByIdAndUpdate(match.nextMatchId, update);
+    await maybeAutoAdvanceBye(match.nextMatchId.toString());
+  } else if (match.status === 'completed' && !match.nextMatchId) {
+    await Tournament.findByIdAndUpdate(match.tournamentId, { status: 'completed' });
+  }
+
+  const populated = await Match.findById(match._id)
+    .populate('teamAId', 'name player1 player2 seed')
+    .populate('teamBId', 'name player1 player2 seed')
+    .populate('winnerId', 'name')
+    .lean();
+  res.json({ match: populated });
+});
+
+/** Undo the last point by replaying from the stored initial match state. */
+router.post('/:id/undo-point', requireTournamentAuth, requireScorer, requireDb, async (req, res) => {
+  const match = await Match.findById(req.params.id);
+  if (!match) return res.status(404).json({ error: 'Match not found' });
+  if (match.points.length === 0) {
+    return res.status(409).json({ error: 'No points to undo' });
+  }
+  if (
+    match.initialServingTeam == null ||
+    match.initialRightCourtPlayerA == null ||
+    match.initialRightCourtPlayerB == null
+  ) {
+    return res.status(409).json({ error: 'Match has no recorded initial state' });
+  }
+
+  const log = [...match.points];
+  log.pop();
+
+  let state = {
+    scoreA: 0,
+    scoreB: 0,
+    servingTeam: match.initialServingTeam,
+    rightCourtPlayerA: match.initialRightCourtPlayerA,
+    rightCourtPlayerB: match.initialRightCourtPlayerB,
+  };
+  const sets: SetScore[] = [{ a: 0, b: 0 }];
+  let currentSetIdx = 0;
+
+  for (const p of log) {
+    state = applyPoint(state, p.winner);
+    sets[currentSetIdx].a = state.scoreA;
+    sets[currentSetIdx].b = state.scoreB;
+    const w = isSetWon(sets[currentSetIdx], match.pointsPerSet);
+    if (w) {
+      sets[currentSetIdx].winner = w;
+      const overall = matchWinner(sets, match.bestOf);
+      if (!overall) {
+        sets.push({ a: 0, b: 0 });
+        currentSetIdx += 1;
+        state = {
+          scoreA: 0,
+          scoreB: 0,
+          servingTeam: w,
+          rightCourtPlayerA: state.rightCourtPlayerA,
+          rightCourtPlayerB: state.rightCourtPlayerB,
+        };
+      }
+    }
+  }
+
+  match.sets = sets;
+  match.currentSet = currentSetIdx;
+  match.servingTeam = state.servingTeam;
+  match.rightCourtPlayerA = state.rightCourtPlayerA;
+  match.rightCourtPlayerB = state.rightCourtPlayerB;
+  match.points = log;
+  match.scoreA = state.scoreA;
+  match.scoreB = state.scoreB;
+  match.status = 'in_progress';
+  match.winnerId = undefined;
+  match.completedAt = undefined;
+  await match.save();
+
+  const populated = await Match.findById(match._id)
+    .populate('teamAId', 'name player1 player2 seed')
+    .populate('teamBId', 'name player1 player2 seed')
+    .lean();
+  res.json({ match: populated });
+});
+
+/**
+ * Clear a manually-picked winner: resets the match to pending, removes the winner slot
+ * from the next match. Refuses if the next match has itself been completed or if live
+ * scoring has been recorded (use /undo-point for that case).
+ */
+router.post('/:id/clear-winner', requireTournamentAuth, requireManager, requireDb, async (req, res) => {
+  const match = await Match.findById(req.params.id);
+  if (!match) return res.status(404).json({ error: 'Match not found' });
+  if (!match.winnerId) return res.status(409).json({ error: 'Match has no winner to clear' });
+  if (match.status === 'bye') return res.status(409).json({ error: 'Cannot clear a bye' });
+  if ((match.points?.length ?? 0) > 0) {
+    return res.status(409).json({
+      error: 'Match has scored points — use undo from the scorer to roll back point-by-point',
+    });
+  }
+
+  if (match.nextMatchId) {
+    const next = await Match.findById(match.nextMatchId);
+    if (next?.winnerId || (next?.points?.length ?? 0) > 0) {
+      return res.status(409).json({
+        error: 'The follow-up match has already been played or started. Clear that first.',
+      });
+    }
+    const unset = match.slot === 'A' ? { teamAId: 1 } : { teamBId: 1 };
+    await Match.findByIdAndUpdate(match.nextMatchId, { $unset: unset });
+  }
+
+  match.winnerId = undefined;
+  match.status = match.teamAId && match.teamBId ? 'pending' : 'bye';
+  match.scoreA = undefined;
+  match.scoreB = undefined;
+  match.sets = [];
+  match.currentSet = 0;
+  match.servingTeam = undefined;
+  match.rightCourtPlayerA = undefined;
+  match.rightCourtPlayerB = undefined;
+  match.initialServingTeam = undefined;
+  match.initialRightCourtPlayerA = undefined;
+  match.initialRightCourtPlayerB = undefined;
+  match.startedAt = undefined;
+  match.completedAt = undefined;
+  await match.save();
+
+  // If clearing a final match, revert tournament status back from completed
+  if (!match.nextMatchId) {
+    const t = await Tournament.findById(match.tournamentId);
+    if (t && t.status === 'completed') {
+      t.status = 'in_progress';
+      await t.save();
+    }
+  }
+
+  const populated = await Match.findById(match._id)
+    .populate('teamAId', 'name')
+    .populate('teamBId', 'name')
+    .lean();
+  res.json({ match: populated });
 });
 
 router.post('/:id/winner', requireTournamentAuth, requireManager, requireDb, async (req, res) => {
@@ -175,6 +493,7 @@ router.post(
 
     const round1Count = size / 2;
     const round1Docs = [];
+    const round1Format = formatForRound(tournament.roundFormats, 1, rounds);
     for (let i = 0; i < round1Count; i++) {
       const aTeam = positionToTeam[i * 2];
       const bTeam = positionToTeam[i * 2 + 1];
@@ -187,6 +506,8 @@ router.post(
         teamBId: bTeam ? new Types.ObjectId(bTeam) : undefined,
         slot: i % 2 === 0 ? 'A' : 'B',
         status: isBye ? 'bye' : aTeam && bTeam ? 'pending' : 'bye',
+        pointsPerSet: round1Format.pointsPerSet,
+        bestOf: round1Format.bestOf,
       });
     }
     const round1 = await Match.insertMany(round1Docs);
@@ -195,6 +516,7 @@ router.post(
     // Create subsequent rounds as empty matches
     for (let r = 2; r <= rounds; r++) {
       const count = size / Math.pow(2, r);
+      const fmt = formatForRound(tournament.roundFormats, r, rounds);
       const docs = [];
       for (let i = 0; i < count; i++) {
         docs.push({
@@ -203,6 +525,8 @@ router.post(
           position: i,
           slot: i % 2 === 0 ? 'A' : 'B',
           status: 'pending' as const,
+          pointsPerSet: fmt.pointsPerSet,
+          bestOf: fmt.bestOf,
         });
       }
       const inserted = await Match.insertMany(docs);

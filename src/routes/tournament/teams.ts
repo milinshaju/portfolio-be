@@ -21,6 +21,43 @@ router.get('/', requireDb, async (req, res) => {
   res.json({ teams });
 });
 
+router.post('/register', requireDb, async (req, res) => {
+  const { tournamentId, name, player1, player2, phone, email, notes } = req.body ?? {};
+  if (!tournamentId || !name || !player1 || !player2) {
+    return res.status(400).json({ error: 'tournamentId, name, player1, player2 required' });
+  }
+  const t = await Tournament.findById(tournamentId);
+  if (!t) return res.status(404).json({ error: 'Tournament not found' });
+  if (!t.publicRegistrationOpen) {
+    return res.status(403).json({ error: 'Public registration is not open for this tournament' });
+  }
+  if (t.status === 'in_progress' || t.status === 'completed') {
+    return res.status(409).json({ error: 'Registration closed — tournament already started' });
+  }
+
+  const count = await Team.countDocuments({ tournamentId });
+  if (count >= t.size) {
+    return res.status(409).json({ error: `Tournament is full (${t.size} teams max)` });
+  }
+
+  const dupe = await Team.findOne({
+    tournamentId,
+    name: new RegExp(`^${String(name).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i'),
+  });
+  if (dupe) return res.status(409).json({ error: 'A team with that name is already registered' });
+
+  const team = await Team.create({
+    tournamentId,
+    name: String(name).trim(),
+    player1: String(player1).trim(),
+    player2: String(player2).trim(),
+    phone: phone ? String(phone).trim() : undefined,
+    email: email ? String(email).trim() : undefined,
+    notes: notes ? String(notes).trim() : undefined,
+  });
+  res.status(201).json({ team: { _id: team._id, name: team.name } });
+});
+
 router.post('/', requireTournamentAuth, requireManager, requireDb, async (req, res) => {
   const { tournamentId, name, player1, player2, phone, email, seed, notes } = req.body ?? {};
   if (!tournamentId || !name || !player1 || !player2) {

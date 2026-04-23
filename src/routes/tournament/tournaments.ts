@@ -54,6 +54,7 @@ router.post('/', requireTournamentAuth, requireManager, requireDb, async (req, r
     prize,
     rules,
     isActive,
+    publicRegistrationOpen,
   } = body;
 
   if (!name) return res.status(400).json({ error: 'name required' });
@@ -81,6 +82,7 @@ router.post('/', requireTournamentAuth, requireManager, requireDb, async (req, r
     prize,
     rules,
     isActive: Boolean(isActive),
+    publicRegistrationOpen: Boolean(publicRegistrationOpen),
   });
   res.status(201).json({ tournament });
 });
@@ -100,6 +102,8 @@ router.patch('/:id', requireTournamentAuth, requireManager, requireDb, async (re
     'entryFee',
     'prize',
     'rules',
+    'publicRegistrationOpen',
+    'roundFormats',
   ] as const;
   const updates: Record<string, unknown> = {};
   for (const k of allowed) {
