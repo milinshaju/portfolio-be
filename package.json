@@ -8,11 +8,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",
-    "seed:superadmin": "tsx scripts/seed-superadmin.ts",
-    "seed:members": "tsx scripts/seed-members.ts",
-    "seed:slots": "tsx scripts/seed-slots.ts",
-    "seed:tournament-superadmin": "tsx scripts/seed-tournament-superadmin.ts",
-    "reset:slots-payments": "tsx scripts/reset-slots-payments.ts"
+    "seed:tournament-superadmin": "tsx scripts/seed-tournament-superadmin.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

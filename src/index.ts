@@ -6,7 +6,6 @@ import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
 import { connectDB } from './db';
 import portfolioRouter from './routes/portfolio';
-import clubRouter from './routes/club';
 import tournamentRouter from './routes/tournament';
 
 if (!process.env.JWT_SECRET) {
@@ -37,7 +36,6 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.use('/api/portfolio', portfolioRouter);
-app.use('/api/club', clubRouter);
 app.use('/api/tournament', tournamentRouter);
 
 app.use((_req, res) => {
